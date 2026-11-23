@@ -6,38 +6,25 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 355
 
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
-          Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -46,68 +33,180 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires | Out-Null
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          Write-Host "Usuario RDP creado"
+
+      # IMPORTANTE: crear el perfil de Windows ANTES de restaurar archivos.
+      - name: Crear perfil del usuario RDP
+        run: |
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public class ProfileCreator {
+              [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+              public static extern int CreateProfile(string pszUserSid, string pszUserName, StringBuilder pszProfilePath, uint cchProfilePath);
+          }
+          "@
+          $sid = (Get-LocalUser -Name "RDP").SID.Value
+          $path = New-Object System.Text.StringBuilder 260
+          $hr = [ProfileCreator]::CreateProfile($sid, "RDP", $path, 260)
+          Write-Host "CreateProfile resultado: $hr | Ruta: $path"
+          if (-not (Test-Path "C:\Users\RDP")) {
+            Write-Error "No se creó el perfil C:\Users\RDP"
+            exit 1
+          }
+          Get-ChildItem "C:\Users" | Select-Object Name
+
+      - name: Instalar rclone + VS Code
+        run: |
+          $rcloneDir = "C:\rclone"
+          New-Item -ItemType Directory -Path $rcloneDir -Force | Out-Null
+          $zip = "$env:TEMP\rclone.zip"
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:TEMP\rclone-extract" -Force
+          $extracted = Get-ChildItem "$env:TEMP\rclone-extract" -Directory | Select-Object -First 1
+          Copy-Item "$($extracted.FullName)\rclone.exe" -Destination "$rcloneDir\rclone.exe" -Force
+          & "C:\rclone\rclone.exe" version
+
+          choco install vscode -y --no-progress
+          choco install github-desktop -y --no-progress
+
+      - name: Restaurar archivos desde Google Drive
+        env:
+          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:RCLONE_CONFIG_DATA)) {
+            Write-Error "El secret RCLONE_CONFIG está vacío"
+            exit 1
+          }
+
+          [System.IO.File]::WriteAllText("C:\rclone.conf", $env:RCLONE_CONFIG_DATA, (New-Object System.Text.UTF8Encoding($false)))
+
+          $rc = "C:\rclone\rclone.exe"
+
+          Write-Host "=== Remotos en la config ==="
+          & $rc listremotes --config "C:\rclone.conf"
+
+          Write-Host "=== Contenido de Backup_GitHub_PC en Drive ==="
+          & $rc lsd "gdrive:Backup_GitHub_PC" --config "C:\rclone.conf"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "rclone no pudo conectar con Drive (revisa nombre del remoto 'gdrive' y el token)"
+            exit 1
+          }
+
+          $p = "C:\Users\RDP"
+
+          function Restore($remote, $dest) {
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Write-Host "--- Restaurando $remote -> $dest"
+            & $rc copy "gdrive:Backup_GitHub_PC/$remote" $dest --config "C:\rclone.conf" --create-empty-src-dirs --transfers 8 -v
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Falló $remote (código $LASTEXITCODE)" }
+          }
+
+          Restore "Edge_Local"            "$p\AppData\Local\Microsoft\Edge\User Data"
+          Restore "VSCode_User"           "$p\AppData\Roaming\Code\User"
+          Restore "Desktop"               "$p\Desktop"
+          Restore "Documents"             "$p\Documents"
+          Restore "Downloads"             "$p\Downloads"
+          Restore "GitHubDesktop_Roaming" "$p\AppData\Roaming\GitHub Desktop"
+          icacls "$p" /grant "RDP:(OI)(CI)F" /T /Q
+
+          Write-Host "=== Desktop restaurado ==="
+          Get-ChildItem "$p\Desktop" -Force | Select-Object Name, Length
+
+          # Extensiones de VS Code
+          $code = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
+          $extFile = "$p\Desktop\vscode_extensions.txt"
+          if ((Test-Path $extFile) -and (Test-Path $code)) {
+            Write-Host "Instalando extensiones de VS Code..."
+            New-Item -ItemType Directory -Path "$p\.vscode\extensions" -Force | Out-Null
+            Get-Content $extFile | ForEach-Object {
+              $ext = $_.Trim()
+              if ($ext) {
+                & $code --extensions-dir "$p\.vscode\extensions" --install-extension $ext --force
+              }
+            }
+            icacls "$p\.vscode" /grant "RDP:(OI)(CI)F" /T /Q
           }
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          while (-not $tsIP -and $retries -lt 12) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+              if (-not $tsIP) { Start-Sleep -Seconds 5; $retries++ }
           }
-          
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "Tailscale IP not assigned"
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+          Write-Host "Tailscale IP: $tsIP"
+
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+              Write-Error "No se pudo conectar al puerto 3389"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "Conexión RDP lista"
 
-      - name: Maintain Connection
+      # Usa COPY, no SYNC: nunca borra nada de tu Drive.
+      # Backup cada 30 min y backup final antes de que se cumplan las 6h.
+      - name: Maintain Connection + Backup cada 30 min
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "`n========================================"
+          Write-Host "=== DATOS DE ACCESO RDP ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+          Write-Host "$env:RDP_CREDS"
+          Write-Host "========================================`n"
+
+          function Backup-All {
+            $p  = "C:\Users\RDP"
+            $rc = "C:\rclone\rclone.exe"
+            $c  = "--config", "C:\rclone.conf"
+            try {
+              & $rc copy "$p\AppData\Local\Microsoft\Edge\User Data" "gdrive:Backup_GitHub_PC/Edge_Local" @c --transfers 4 `
+                --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "GrShaderCache/**" `
+                --exclude "ShaderCache/**" --exclude "DawnCache/**" --exclude "*/Cache/**" --exclude "*/Code Cache/**" `
+                --exclude "*/GPUCache/**" --exclude "*/Service Worker/CacheStorage/**" --exclude "Crashpad/**" `
+                --exclude "lockfile" --exclude "Singleton*" --exclude "*.lock"
+              & $rc copy "$p\AppData\Roaming\GitHub Desktop" "gdrive:Backup_GitHub_PC/GitHubDesktop_Roaming" @c --transfers 4 --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "*.lock"
+              & $rc copy "$p\Desktop"   "gdrive:Backup_GitHub_PC/Desktop"   @c --max-size 100M --transfers 4
+              & $rc copy "$p\Documents" "gdrive:Backup_GitHub_PC/Documents" @c --max-size 100M --transfers 4
+              & $rc copy "$p\Downloads" "gdrive:Backup_GitHub_PC/Downloads" @c --max-size 100M --transfers 4
+              & $rc copy "$p\AppData\Roaming\Code\User" "gdrive:Backup_GitHub_PC/VSCode_User" @c --transfers 4
+              Write-Host "$(Get-Date) - Backup realizado"
+            } catch {
+              Write-Host "$(Get-Date) - Error en backup: $_"
+            }
           }
+
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $maxMinutes = 340
+          $i = 0
+          while ($sw.Elapsed.TotalMinutes -lt $maxMinutes) {
+              Write-Host "[$(Get-Date)] RDP Active - $([int]$sw.Elapsed.TotalMinutes) min"
+              Start-Sleep -Seconds 300
+              $i++
+              if ($i % 6 -eq 0) { Backup-All }
+          }
+
+          Write-Host "=== BACKUP FINAL antes de que se cierre el runner ==="
+          Backup-All
+          Write-Host "$(Get-Date) - Backup final terminado"
