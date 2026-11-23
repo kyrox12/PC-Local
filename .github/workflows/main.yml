@@ -39,7 +39,6 @@ jobs:
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
           Write-Host "Usuario RDP creado"
 
-      # IMPORTANTE: crear el perfil de Windows ANTES de restaurar archivos.
       - name: Crear perfil del usuario RDP
         run: |
           Add-Type -TypeDefinition @"
@@ -118,7 +117,6 @@ jobs:
           Write-Host "=== Desktop restaurado ==="
           Get-ChildItem "$p\Desktop" -Force | Select-Object Name, Length
 
-          # Extensiones de VS Code
           $code = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
           $extFile = "$p\Desktop\vscode_extensions.txt"
           if ((Test-Path $extFile) -and (Test-Path $code)) {
@@ -143,7 +141,7 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAISKALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 12) {
@@ -166,8 +164,6 @@ jobs:
           }
           Write-Host "Conexión RDP lista"
 
-      # Usa COPY, no SYNC: nunca borra nada de tu Drive.
-      # Backup cada 30 min y backup final antes de que se cumplan las 6h.
       - name: Maintain Connection + Backup cada 30 min
         run: |
           Write-Host "`n========================================"
@@ -181,11 +177,11 @@ jobs:
             $rc = "C:\rclone\rclone.exe"
             $c  = "--config", "C:\rclone.conf"
             try {
-              & $rc copy "$p\AppData\Local\Microsoft\Edge\User Data" "gdrive:Backup_GitHub_PC/Edge_Local" @c --transfers 4 `
+              & $rc copy "$p\AppData\Local\Microsoft\Edge\User Data" "gdrive:Backup_GitHub_PC/Edge_Local" @c --transfers 4 --retries 1 `
                 --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "GrShaderCache/**" `
                 --exclude "ShaderCache/**" --exclude "DawnCache/**" --exclude "*/Cache/**" --exclude "*/Code Cache/**" `
                 --exclude "*/GPUCache/**" --exclude "*/Service Worker/CacheStorage/**" --exclude "Crashpad/**" `
-                --exclude "lockfile" --exclude "Singleton*" --exclude "*.lock"
+                --exclude "LOCK" --exclude "*/LOCK" --exclude "lockfile" --exclude "Singleton*" --exclude "*.lock"
               & $rc copy "$p\AppData\Roaming\GitHub Desktop" "gdrive:Backup_GitHub_PC/GitHubDesktop_Roaming" @c --transfers 4 --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "*.lock"
               & $rc copy "$p\Desktop"   "gdrive:Backup_GitHub_PC/Desktop"   @c --max-size 100M --transfers 4
               & $rc copy "$p\Documents" "gdrive:Backup_GitHub_PC/Documents" @c --max-size 100M --transfers 4
