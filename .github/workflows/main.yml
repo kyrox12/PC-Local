@@ -3,6 +3,10 @@ name: RDP
 on:
   workflow_dispatch:
 
+concurrency:
+  group: rdp
+  cancel-in-progress: false
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -60,7 +64,7 @@ jobs:
           }
           Get-ChildItem "C:\Users" | Select-Object Name
 
-      - name: Instalar rclone + VS Code
+      - name: Instalar rclone + VS Code + Git
         run: |
           $rcloneDir = "C:\rclone"
           New-Item -ItemType Directory -Path $rcloneDir -Force | Out-Null
@@ -73,6 +77,123 @@ jobs:
 
           choco install vscode -y --no-progress
           choco install github-desktop -y --no-progress
+          choco install git -y --no-progress
+
+      - name: Crear script de backup
+        run: |
+          $script = @'
+          $p  = "C:\Users\RDP"
+          $rc = "C:\rclone\rclone.exe"
+          $c  = "--config", "C:\rclone.conf"
+          $code = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
+
+          # Lista de extensiones de VS Code (para reinstalarlas al restaurar)
+          if (Test-Path $code) {
+            & $code --extensions-dir "$p\.vscode\extensions" --list-extensions | Set-Content "$p\Desktop\vscode_extensions.txt"
+          }
+
+          & $rc copy "$p\AppData\Local\Microsoft\Edge\User Data" "gdrive:Backup_GitHub_PC/Edge_Local" @c --transfers 4 --retries 1 `
+            --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "GrShaderCache/**" `
+            --exclude "ShaderCache/**" --exclude "DawnCache/**" --exclude "*/Cache/**" --exclude "*/Code Cache/**" `
+            --exclude "*/GPUCache/**" --exclude "*/Service Worker/CacheStorage/**" --exclude "Crashpad/**" `
+            --exclude "LOCK" --exclude "*/LOCK" --exclude "lockfile" --exclude "Singleton*" --exclude "*.lock"
+          & $rc copy "$p\AppData\Roaming\Code\User" "gdrive:Backup_GitHub_PC/VSCode_User" @c --transfers 4
+          & $rc copy "$p\AppData\Roaming\GitHub Desktop" "gdrive:Backup_GitHub_PC/GitHubDesktop_Roaming" @c --transfers 4 `
+            --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "*.lock"
+          & $rc copy "$p\Desktop" "gdrive:Backup_GitHub_PC/Desktop" @c --max-size 100M --transfers 4 `
+            --exclude "node_modules/**"
+          if (Test-Path "$p\.gitconfig") {
+            & $rc copyto "$p\.gitconfig" "gdrive:Backup_GitHub_PC/Git_Config/.gitconfig" @c
+          }
+          Write-Host "$(Get-Date) - Backup realizado"
+          '@
+          Set-Content -Path "C:\backup.ps1" -Value $script -Encoding UTF8
+
+      - name: Optimizar Windows al máximo
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+
+          # ===== ENERGIA: rendimiento máximo, nada de suspender =====
+          $out = powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61
+          if ($out -match '([0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})') {
+            powercfg /setactive $matches[1]
+          } else {
+            powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          }
+          powercfg /hibernate off
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+
+          # ===== ZONA HORARIA (República Dominicana) =====
+          tzutil /s "SA Western Standard Time"
+
+          # ===== DEFENDER: sin escaneo en tiempo real + exclusiones =====
+          Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableIOAVProtection $true -DisableScriptScanning $true -DisableBlockAtFirstSeen $true
+          Add-MpPreference -ExclusionPath "C:\Users\RDP","C:\rclone","C:\Program Files\Microsoft VS Code"
+          Add-MpPreference -ExclusionProcess "rclone.exe","Code.exe","msedge.exe"
+
+          # ===== SERVICIOS QUE SOBRAN =====
+          $servicios = "wuauserv","UsoSvc","WSearch","SysMain","DiagTrack","dmwappushservice","MapsBroker","WerSvc","RetailDemo","lfsvc","PcaSvc","XblAuthManager","XblGameSave","XboxNetApiSvc","XboxGipSvc"
+          foreach ($s in $servicios) {
+            Stop-Service $s -Force
+            Set-Service $s -StartupType Disabled
+          }
+
+          # ===== TAREAS PROGRAMADAS PESADAS =====
+          $rutas = "\Microsoft\Windows\Application Experience\","\Microsoft\Windows\Customer Experience Improvement Program\","\Microsoft\Windows\Windows Error Reporting\","\Microsoft\Windows\DiskDiagnostic\","\Microsoft\Windows\Maintenance\","\Microsoft\Windows\UpdateOrchestrator\","\Microsoft\Windows\WindowsUpdate\"
+          foreach ($r in $rutas) {
+            Get-ScheduledTask -TaskPath $r | Disable-ScheduledTask | Out-Null
+          }
+
+          # ===== POLITICAS DEL SISTEMA =====
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" /v AllowTelemetry /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoUpdate /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search" /v AllowCortana /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Microsoft\ServerManager" /v DoNotOpenServerManagerAtLogon /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Reliability" /v ShutdownReasonOn /t REG_DWORD /d 0 /f
+
+          # ===== ESCRITORIO REMOTO: fluido, sin cortes, con unidades USB =====
+          $ts = "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          reg add $ts /v MaxIdleTime /t REG_DWORD /d 0 /f
+          reg add $ts /v MaxDisconnectionTime /t REG_DWORD /d 0 /f
+          reg add $ts /v fResetBroken /t REG_DWORD /d 0 /f
+          reg add $ts /v KeepAliveEnable /t REG_DWORD /d 1 /f
+          reg add $ts /v KeepAliveInterval /t REG_DWORD /d 1 /f
+          reg add $ts /v fNoRemoteDesktopWallpaper /t REG_DWORD /d 1 /f
+          reg add $ts /v fDisableCdm /t REG_DWORD /d 0 /f
+          reg add $ts /v fDisableAutoReconnect /t REG_DWORD /d 0 /f
+
+          # ===== PERFIL DEL USUARIO RDP: modo rendimiento =====
+          reg load HKU\RDPHIVE "C:\Users\RDP\NTUSER.DAT"
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop" /v DragFullWindows /t REG_SZ /d 0 /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop" /v Wallpaper /t REG_SZ /d "" /f
+          reg add "HKU\RDPHIVE\Control Panel\Colors" /v Background /t REG_SZ /d "30 30 30" /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v ListviewAlphaSelect /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v ListviewShadow /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v HideFileExt /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v Hidden /t REG_DWORD /d 1 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Search" /v BingSearchEnabled /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SilentInstalledAppsEnabled /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContentEnabled /t REG_DWORD /d 0 /f
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload HKU\RDPHIVE
+
+          # ===== LIMPIEZA DE TEMPORALES =====
+          Remove-Item "$env:TEMP\*" -Recurse -Force
+          Remove-Item "C:\Windows\Temp\*" -Recurse -Force
+          Remove-Item "C:\Windows\SoftwareDistribution\Download\*" -Recurse -Force
+
+          Write-Host "=== Optimización aplicada ==="
+          exit 0
 
       - name: Restaurar archivos desde Google Drive
         env:
@@ -108,10 +229,9 @@ jobs:
 
           Restore "Edge_Local"            "$p\AppData\Local\Microsoft\Edge\User Data"
           Restore "VSCode_User"           "$p\AppData\Roaming\Code\User"
-          Restore "Desktop"               "$p\Desktop"
-          Restore "Documents"             "$p\Documents"
-          Restore "Downloads"             "$p\Downloads"
           Restore "GitHubDesktop_Roaming" "$p\AppData\Roaming\GitHub Desktop"
+          Restore "Desktop"               "$p\Desktop"
+          & $rc copyto "gdrive:Backup_GitHub_PC/Git_Config/.gitconfig" "$p\.gitconfig" --config "C:\rclone.conf"
           icacls "$p" /grant "RDP:(OI)(CI)F" /T /Q
 
           Write-Host "=== Desktop restaurado ==="
@@ -157,8 +277,13 @@ jobs:
 
       - name: Verify RDP Accessibility
         run: |
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
+          $ok = $false
+          for ($i = 1; $i -le 6; $i++) {
+              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+              if ($testResult.TcpTestSucceeded) { $ok = $true; break }
+              Start-Sleep -Seconds 10
+          }
+          if (-not $ok) {
               Write-Error "No se pudo conectar al puerto 3389"
               exit 1
           }
@@ -172,26 +297,323 @@ jobs:
           Write-Host "$env:RDP_CREDS"
           Write-Host "========================================`n"
 
-          function Backup-All {
-            $p  = "C:\Users\RDP"
-            $rc = "C:\rclone\rclone.exe"
-            $c  = "--config", "C:\rclone.conf"
-            try {
-              & $rc copy "$p\AppData\Local\Microsoft\Edge\User Data" "gdrive:Backup_GitHub_PC/Edge_Local" @c --transfers 4 --retries 1 `
-                --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "GrShaderCache/**" `
-                --exclude "ShaderCache/**" --exclude "DawnCache/**" --exclude "*/Cache/**" --exclude "*/Code Cache/**" `
-                --exclude "*/GPUCache/**" --exclude "*/Service Worker/CacheStorage/**" --exclude "Crashpad/**" `
-                --exclude "LOCK" --exclude "*/LOCK" --exclude "lockfile" --exclude "Singleton*" --exclude "*.lock"
-              & $rc copy "$p\AppData\Roaming\GitHub Desktop" "gdrive:Backup_GitHub_PC/GitHubDesktop_Roaming" @c --transfers 4 --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "*.lock"
-              & $rc copy "$p\Desktop"   "gdrive:Backup_GitHub_PC/Desktop"   @c --max-size 100M --transfers 4
-              & $rc copy "$p\Documents" "gdrive:Backup_GitHub_PC/Documents" @c --max-size 100M --transfers 4
-              & $rc copy "$p\Downloads" "gdrive:Backup_GitHub_PC/Downloads" @c --max-size 100M --transfers 4
-              & $rc copy "$p\AppData\Roaming\Code\User" "gdrive:Backup_GitHub_PC/VSCode_User" @c --transfers 4
-              Write-Host "$(Get-Date) - Backup realizado"
-            } catch {
-              Write-Host "$(Get-Date) - Error en backup: $_"
-            }
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $maxMinutes = 340
+          $i = 0
+          while ($sw.Elapsed.TotalMinutes -lt $maxMinutes) {
+              Write-Host "[$(Get-Date)] RDP Active - $([int]$sw.Elapsed.TotalMinutes) min"
+              Start-Sleep -Seconds 300
+              $i++
+              if ($i % 6 -eq 0) { & "C:\backup.ps1" }
           }
+
+          Write-Host "=== BACKUP FINAL antes de que se cierre el runner ==="
+          & "C:\backup.ps1"
+          Write-Host "$(Get-Date) - Backup final terminado"
+
+      - name: Backup al cancelar o terminar
+        if: ${{ always() }}
+        run: |
+          if ((Test-Path "C:\backup.ps1") -and (Test-Path "C:\rclone.conf")) {
+            & "C:\backup.ps1"
+          }name: RDP
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: rdp
+  cancel-in-progress: false
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          Write-Host "Usuario RDP creado"
+
+      - name: Crear perfil del usuario RDP
+        run: |
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public class ProfileCreator {
+              [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+              public static extern int CreateProfile(string pszUserSid, string pszUserName, StringBuilder pszProfilePath, uint cchProfilePath);
+          }
+          "@
+          $sid = (Get-LocalUser -Name "RDP").SID.Value
+          $path = New-Object System.Text.StringBuilder 260
+          $hr = [ProfileCreator]::CreateProfile($sid, "RDP", $path, 260)
+          Write-Host "CreateProfile resultado: $hr | Ruta: $path"
+          if (-not (Test-Path "C:\Users\RDP")) {
+            Write-Error "No se creó el perfil C:\Users\RDP"
+            exit 1
+          }
+          Get-ChildItem "C:\Users" | Select-Object Name
+
+      - name: Instalar rclone + VS Code + Git
+        run: |
+          $rcloneDir = "C:\rclone"
+          New-Item -ItemType Directory -Path $rcloneDir -Force | Out-Null
+          $zip = "$env:TEMP\rclone.zip"
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:TEMP\rclone-extract" -Force
+          $extracted = Get-ChildItem "$env:TEMP\rclone-extract" -Directory | Select-Object -First 1
+          Copy-Item "$($extracted.FullName)\rclone.exe" -Destination "$rcloneDir\rclone.exe" -Force
+          & "C:\rclone\rclone.exe" version
+
+          choco install vscode -y --no-progress
+          choco install github-desktop -y --no-progress
+          choco install git -y --no-progress
+
+      - name: Crear script de backup
+        run: |
+          $script = @'
+          $p  = "C:\Users\RDP"
+          $rc = "C:\rclone\rclone.exe"
+          $c  = "--config", "C:\rclone.conf"
+          $code = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
+
+          # Lista de extensiones de VS Code (para reinstalarlas al restaurar)
+          if (Test-Path $code) {
+            & $code --extensions-dir "$p\.vscode\extensions" --list-extensions | Set-Content "$p\Desktop\vscode_extensions.txt"
+          }
+
+          & $rc copy "$p\AppData\Local\Microsoft\Edge\User Data" "gdrive:Backup_GitHub_PC/Edge_Local" @c --transfers 4 --retries 1 `
+            --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "GrShaderCache/**" `
+            --exclude "ShaderCache/**" --exclude "DawnCache/**" --exclude "*/Cache/**" --exclude "*/Code Cache/**" `
+            --exclude "*/GPUCache/**" --exclude "*/Service Worker/CacheStorage/**" --exclude "Crashpad/**" `
+            --exclude "LOCK" --exclude "*/LOCK" --exclude "lockfile" --exclude "Singleton*" --exclude "*.lock"
+          & $rc copy "$p\AppData\Roaming\Code\User" "gdrive:Backup_GitHub_PC/VSCode_User" @c --transfers 4
+          & $rc copy "$p\AppData\Roaming\GitHub Desktop" "gdrive:Backup_GitHub_PC/GitHubDesktop_Roaming" @c --transfers 4 `
+            --exclude "Cache/**" --exclude "Code Cache/**" --exclude "GPUCache/**" --exclude "*.lock"
+          & $rc copy "$p\Desktop" "gdrive:Backup_GitHub_PC/Desktop" @c --max-size 100M --transfers 4 `
+            --exclude "node_modules/**"
+          if (Test-Path "$p\.gitconfig") {
+            & $rc copyto "$p\.gitconfig" "gdrive:Backup_GitHub_PC/Git_Config/.gitconfig" @c
+          }
+          Write-Host "$(Get-Date) - Backup realizado"
+          '@
+          Set-Content -Path "C:\backup.ps1" -Value $script -Encoding UTF8
+
+      - name: Optimizar Windows al máximo
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+
+          # ===== ENERGIA: rendimiento máximo, nada de suspender =====
+          $out = powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61
+          if ($out -match '([0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})') {
+            powercfg /setactive $matches[1]
+          } else {
+            powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          }
+          powercfg /hibernate off
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+
+          # ===== ZONA HORARIA (República Dominicana) =====
+          tzutil /s "SA Western Standard Time"
+
+          # ===== DEFENDER: sin escaneo en tiempo real + exclusiones =====
+          Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableIOAVProtection $true -DisableScriptScanning $true -DisableBlockAtFirstSeen $true
+          Add-MpPreference -ExclusionPath "C:\Users\RDP","C:\rclone","C:\Program Files\Microsoft VS Code"
+          Add-MpPreference -ExclusionProcess "rclone.exe","Code.exe","msedge.exe"
+
+          # ===== SERVICIOS QUE SOBRAN =====
+          $servicios = "wuauserv","UsoSvc","WSearch","SysMain","DiagTrack","dmwappushservice","MapsBroker","WerSvc","RetailDemo","lfsvc","PcaSvc","XblAuthManager","XblGameSave","XboxNetApiSvc","XboxGipSvc"
+          foreach ($s in $servicios) {
+            Stop-Service $s -Force
+            Set-Service $s -StartupType Disabled
+          }
+
+          # ===== TAREAS PROGRAMADAS PESADAS =====
+          $rutas = "\Microsoft\Windows\Application Experience\","\Microsoft\Windows\Customer Experience Improvement Program\","\Microsoft\Windows\Windows Error Reporting\","\Microsoft\Windows\DiskDiagnostic\","\Microsoft\Windows\Maintenance\","\Microsoft\Windows\UpdateOrchestrator\","\Microsoft\Windows\WindowsUpdate\"
+          foreach ($r in $rutas) {
+            Get-ScheduledTask -TaskPath $r | Disable-ScheduledTask | Out-Null
+          }
+
+          # ===== POLITICAS DEL SISTEMA =====
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" /v AllowTelemetry /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoUpdate /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search" /v AllowCortana /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Microsoft\ServerManager" /v DoNotOpenServerManagerAtLogon /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Reliability" /v ShutdownReasonOn /t REG_DWORD /d 0 /f
+
+          # ===== ESCRITORIO REMOTO: fluido, sin cortes, con unidades USB =====
+          $ts = "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          reg add $ts /v MaxIdleTime /t REG_DWORD /d 0 /f
+          reg add $ts /v MaxDisconnectionTime /t REG_DWORD /d 0 /f
+          reg add $ts /v fResetBroken /t REG_DWORD /d 0 /f
+          reg add $ts /v KeepAliveEnable /t REG_DWORD /d 1 /f
+          reg add $ts /v KeepAliveInterval /t REG_DWORD /d 1 /f
+          reg add $ts /v fNoRemoteDesktopWallpaper /t REG_DWORD /d 1 /f
+          reg add $ts /v fDisableCdm /t REG_DWORD /d 0 /f
+          reg add $ts /v fDisableAutoReconnect /t REG_DWORD /d 0 /f
+
+          # ===== PERFIL DEL USUARIO RDP: modo rendimiento =====
+          reg load HKU\RDPHIVE "C:\Users\RDP\NTUSER.DAT"
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop" /v DragFullWindows /t REG_SZ /d 0 /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop" /v Wallpaper /t REG_SZ /d "" /f
+          reg add "HKU\RDPHIVE\Control Panel\Colors" /v Background /t REG_SZ /d "30 30 30" /f
+          reg add "HKU\RDPHIVE\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v ListviewAlphaSelect /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v ListviewShadow /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v HideFileExt /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v Hidden /t REG_DWORD /d 1 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\Search" /v BingSearchEnabled /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SilentInstalledAppsEnabled /t REG_DWORD /d 0 /f
+          reg add "HKU\RDPHIVE\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContentEnabled /t REG_DWORD /d 0 /f
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload HKU\RDPHIVE
+
+          # ===== LIMPIEZA DE TEMPORALES =====
+          Remove-Item "$env:TEMP\*" -Recurse -Force
+          Remove-Item "C:\Windows\Temp\*" -Recurse -Force
+          Remove-Item "C:\Windows\SoftwareDistribution\Download\*" -Recurse -Force
+
+          Write-Host "=== Optimización aplicada ==="
+          exit 0
+
+      - name: Restaurar archivos desde Google Drive
+        env:
+          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:RCLONE_CONFIG_DATA)) {
+            Write-Error "El secret RCLONE_CONFIG está vacío"
+            exit 1
+          }
+
+          [System.IO.File]::WriteAllText("C:\rclone.conf", $env:RCLONE_CONFIG_DATA, (New-Object System.Text.UTF8Encoding($false)))
+
+          $rc = "C:\rclone\rclone.exe"
+
+          Write-Host "=== Remotos en la config ==="
+          & $rc listremotes --config "C:\rclone.conf"
+
+          Write-Host "=== Contenido de Backup_GitHub_PC en Drive ==="
+          & $rc lsd "gdrive:Backup_GitHub_PC" --config "C:\rclone.conf"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "rclone no pudo conectar con Drive (revisa nombre del remoto 'gdrive' y el token)"
+            exit 1
+          }
+
+          $p = "C:\Users\RDP"
+
+          function Restore($remote, $dest) {
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Write-Host "--- Restaurando $remote -> $dest"
+            & $rc copy "gdrive:Backup_GitHub_PC/$remote" $dest --config "C:\rclone.conf" --create-empty-src-dirs --transfers 8 -v
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Falló $remote (código $LASTEXITCODE)" }
+          }
+
+          Restore "Edge_Local"            "$p\AppData\Local\Microsoft\Edge\User Data"
+          Restore "VSCode_User"           "$p\AppData\Roaming\Code\User"
+          Restore "GitHubDesktop_Roaming" "$p\AppData\Roaming\GitHub Desktop"
+          Restore "Desktop"               "$p\Desktop"
+          & $rc copyto "gdrive:Backup_GitHub_PC/Git_Config/.gitconfig" "$p\.gitconfig" --config "C:\rclone.conf"
+          icacls "$p" /grant "RDP:(OI)(CI)F" /T /Q
+
+          Write-Host "=== Desktop restaurado ==="
+          Get-ChildItem "$p\Desktop" -Force | Select-Object Name, Length
+
+          $code = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
+          $extFile = "$p\Desktop\vscode_extensions.txt"
+          if ((Test-Path $extFile) -and (Test-Path $code)) {
+            Write-Host "Instalando extensiones de VS Code..."
+            New-Item -ItemType Directory -Path "$p\.vscode\extensions" -Force | Out-Null
+            Get-Content $extFile | ForEach-Object {
+              $ext = $_.Trim()
+              if ($ext) {
+                & $code --extensions-dir "$p\.vscode\extensions" --install-extension $ext --force
+              }
+            }
+            icacls "$p\.vscode" /grant "RDP:(OI)(CI)F" /T /Q
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAISKALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if (-not $tsIP) { Start-Sleep -Seconds 5; $retries++ }
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned"
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Verify RDP Accessibility
+        run: |
+          $ok = $false
+          for ($i = 1; $i -le 6; $i++) {
+              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+              if ($testResult.TcpTestSucceeded) { $ok = $true; break }
+              Start-Sleep -Seconds 10
+          }
+          if (-not $ok) {
+              Write-Error "No se pudo conectar al puerto 3389"
+              exit 1
+          }
+          Write-Host "Conexión RDP lista"
+
+      - name: Maintain Connection + Backup cada 30 min
+        run: |
+          Write-Host "`n========================================"
+          Write-Host "=== DATOS DE ACCESO RDP ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "$env:RDP_CREDS"
+          Write-Host "========================================`n"
 
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
           $maxMinutes = 340
@@ -200,9 +622,16 @@ jobs:
               Write-Host "[$(Get-Date)] RDP Active - $([int]$sw.Elapsed.TotalMinutes) min"
               Start-Sleep -Seconds 300
               $i++
-              if ($i % 6 -eq 0) { Backup-All }
+              if ($i % 6 -eq 0) { & "C:\backup.ps1" }
           }
 
           Write-Host "=== BACKUP FINAL antes de que se cierre el runner ==="
-          Backup-All
+          & "C:\backup.ps1"
           Write-Host "$(Get-Date) - Backup final terminado"
+
+      - name: Backup al cancelar o terminar
+        if: ${{ always() }}
+        run: |
+          if ((Test-Path "C:\backup.ps1") -and (Test-Path "C:\rclone.conf")) {
+            & "C:\backup.ps1"
+          }
